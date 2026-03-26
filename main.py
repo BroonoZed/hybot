@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
 import psycopg2
@@ -22,6 +22,7 @@ def env(name: str, default: str | None = None, required: bool = False) -> str:
 BOT_TOKEN = env("BOT_TOKEN", required=True)
 ALLOWED_TG_IDS = {int(x.strip()) for x in env("ALLOWED_TG_IDS", "7611295576").split(",") if x.strip()}
 ALERT_TG_IDS = {int(x.strip()) for x in env("ALERT_TG_IDS", ",".join(str(x) for x in ALLOWED_TG_IDS)).split(",") if x.strip()}
+ALLOWED_CHAT_IDS = {int(x.strip()) for x in env("ALLOWED_CHAT_IDS", "").split(",") if x.strip()}
 
 DB_HOST = env("DB_HOST", "18.139.56.230")
 DB_PORT = int(env("DB_PORT", "35010"))
@@ -76,6 +77,18 @@ def is_allowed(user_id: int | None) -> bool:
     return user_id is not None and user_id in ALLOWED_TG_IDS
 
 
+def is_chat_allowed(chat_id: int | None) -> bool:
+    if not ALLOWED_CHAT_IDS:
+        return True
+    return chat_id is not None and chat_id in ALLOWED_CHAT_IDS
+
+
+def is_authorized(update: Update) -> bool:
+    user_id = update.effective_user.id if update.effective_user else None
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    return is_allowed(user_id) and is_chat_allowed(chat_id)
+
+
 def get_conn():
     return psycopg2.connect(
         host=DB_HOST,
@@ -88,7 +101,15 @@ def get_conn():
     )
 
 
+def utc_bounds_from_utc8_dates(start_date: str, end_date: str) -> tuple[datetime, datetime]:
+    start_local = datetime.combine(date.fromisoformat(start_date), datetime.min.time(), tzinfo=UTC8)
+    end_local_exclusive = datetime.combine(date.fromisoformat(end_date) + timedelta(days=1), datetime.min.time(), tzinfo=UTC8)
+    return start_local.astimezone(timezone.utc), end_local_exclusive.astimezone(timezone.utc)
+
+
 def query_summary(user_id: int, start_date: str, end_date: str, mch_id: int | None = None):
+    start_utc, end_utc = utc_bounds_from_utc8_dates(start_date, end_date)
+
     base_sql = """
         SELECT
           COUNT(*) AS total_orders,
@@ -101,10 +122,10 @@ def query_summary(user_id: int, start_date: str, end_date: str, mch_id: int | No
           SUM(CASE WHEN status = 0 THEN 1 ELSE 0 END) AS processing_orders,
           SUM(CASE WHEN status = -1 THEN 1 ELSE 0 END) AS canceled_orders
         FROM orders
-        WHERE (create_time AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Shanghai')::date BETWEEN %s AND %s
+        WHERE create_time >= %s AND create_time < %s
     """
 
-    params: list = [start_date, end_date]
+    params: list = [start_utc, end_utc]
     query = sql.SQL(base_sql)
 
     if ORDER_USER_COLUMN.strip():
@@ -268,6 +289,49 @@ def fmt_order(order: dict) -> str:
     return text
 
 
+def query_orders_by_keyword(user_id: int, keyword: str, limit: int = 10) -> list[dict]:
+    like = f"%{keyword.strip()}%"
+    query = sql.SQL(
+        """
+        SELECT o.order_no, o.merchant_order_no, o.mch_id, m.name AS mch_name,
+               o.status, o.order_type, o.real_order_amount, o.create_time,
+               o.txid, o.remark
+        FROM orders o
+        LEFT JOIN public.mchs m ON m.id = o.mch_id
+        WHERE (
+            o.order_no ILIKE %s OR
+            COALESCE(o.merchant_order_no, '') ILIKE %s OR
+            COALESCE(o.remark, '') ILIKE %s OR
+            COALESCE(o.txid, '') ILIKE %s
+        )
+        """
+    )
+    params: list = [like, like, like, like]
+    if ORDER_USER_COLUMN.strip():
+        query += sql.SQL(" AND o.{} = %s").format(sql.Identifier(ORDER_USER_COLUMN))
+        params.append(user_id)
+    query += sql.SQL(" ORDER BY o.id DESC LIMIT %s")
+    params.append(max(1, min(limit, 20)))
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            return [dict(r) for r in (cur.fetchall() or [])]
+
+
+def fmt_order_quick_list(rows: list[dict]) -> str:
+    lines = ["订单快捷列表："]
+    for r in rows:
+        lines.append(
+            f"{r.get('order_no')} | mch={r.get('mch_id')}:{r.get('mch_name') or ''} | "
+            f"status={r.get('status')}({STATUS_LABELS.get(r.get('status'), '未知')}) | "
+            f"type={r.get('order_type')}({ORDER_TYPE_LABELS.get(r.get('order_type'), '未知')}) | "
+            f"amt={r.get('real_order_amount')}"
+        )
+    text = "\n".join(lines)
+    return text[:3800]
+
+
 def fmt_summary(title: str, data: dict) -> str:
     return (
         f"{title}\n"
@@ -283,7 +347,7 @@ def fmt_summary(title: str, data: dict) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_allowed(user.id if user else None):
+    if not is_authorized(update):
         await update.message.reply_text("未授权。")
         return
     await update.message.reply_text(
@@ -293,14 +357,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/yesterday [mch_id或mch_name] - 昨日（UTC+8）汇总\n"
         "/range YYYY-MM-DD YYYY-MM-DD [mch_id或mch_name] - 日期区间汇总（UTC+8）\n"
         "/mchlist [关键词] - 查询商户列表（public.mchs）\n"
+        "/find 关键词 - 订单关键词识别（order_no/商户单号/备注/txid）\n"
+        "/quick [数量] - 快捷订单列表（默认10）\n"
         "/order 订单号 - 查询单笔订单全部信息\n"
+        "/fwd 目标chat_id - 转发你回复的消息到目标chat\n"
+        "/debugchat - 群组/会话访问调试信息\n"
         "/status - 状态说明\n"
         "/dbcheck - 数据库连通性检查"
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id if update.effective_user else None):
+    if not is_authorized(update):
         await update.message.reply_text("未授权。")
         return
     lines = ["状态映射："] + [f"status={k}: {v}" for k, v in STATUS_LABELS.items()]
@@ -309,7 +377,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def dbcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id if update.effective_user else None):
+    if not is_authorized(update):
         await update.message.reply_text("未授权。")
         return
     try:
@@ -334,7 +402,7 @@ async def send_summary(
     mch_input: str | None = None,
 ):
     user_id = update.effective_user.id if update.effective_user else None
-    if not is_allowed(user_id):
+    if not is_authorized(update):
         await update.message.reply_text("未授权。")
         return
     try:
@@ -384,7 +452,7 @@ async def range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_allowed(update.effective_user.id if update.effective_user else None):
+    if not is_authorized(update):
         await update.message.reply_text("未授权。")
         return
 
@@ -410,7 +478,7 @@ async def mchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    if not is_allowed(user_id):
+    if not is_authorized(update):
         await update.message.reply_text("未授权。")
         return
 
@@ -434,6 +502,109 @@ async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception(err)
         await update.message.reply_text("❌ 订单查询失败，已触发告警")
         await alert_admins(context.application, err)
+
+
+async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(update):
+        await update.message.reply_text("未授权。")
+        return
+    if not context.args:
+        await update.message.reply_text("用法: /find 关键词")
+        return
+    keyword = " ".join(context.args).strip()
+    try:
+        rows = query_orders_by_keyword(user_id, keyword, limit=10)
+        if not rows:
+            await update.message.reply_text("未匹配到订单。")
+            return
+        await update.message.reply_text(fmt_order_quick_list(rows))
+    except Exception as e:
+        err = f"关键词订单查询失败 user={user_id} kw={keyword}: {e.__class__.__name__}: {e}"
+        logger.exception(err)
+        await update.message.reply_text("❌ 关键词查询失败，已触发告警")
+        await alert_admins(context.application, err)
+
+
+async def quick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(update):
+        await update.message.reply_text("未授权。")
+        return
+    limit = 10
+    if context.args and context.args[0].isdigit():
+        limit = max(1, min(int(context.args[0]), 20))
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                q = sql.SQL(
+                    "SELECT o.order_no, o.merchant_order_no, o.mch_id, m.name AS mch_name, o.status, o.order_type, o.real_order_amount, o.create_time, o.txid, o.remark FROM orders o LEFT JOIN public.mchs m ON m.id=o.mch_id"
+                )
+                params: list = []
+                if ORDER_USER_COLUMN.strip():
+                    q += sql.SQL(" WHERE o.{} = %s").format(sql.Identifier(ORDER_USER_COLUMN))
+                    params.append(user_id)
+                q += sql.SQL(" ORDER BY o.id DESC LIMIT %s")
+                params.append(limit)
+                cur.execute(q, params)
+                rows = [dict(r) for r in (cur.fetchall() or [])]
+        if not rows:
+            await update.message.reply_text("暂无订单。")
+            return
+        await update.message.reply_text(fmt_order_quick_list(rows))
+    except Exception as e:
+        err = f"快捷列表查询失败 user={user_id}: {e.__class__.__name__}: {e}"
+        logger.exception(err)
+        await update.message.reply_text("❌ 快捷列表查询失败，已触发告警")
+        await alert_admins(context.application, err)
+
+
+async def fwd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("未授权。")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("用法: /fwd 目标chat_id（需回复一条消息使用）")
+        return
+    if not update.message or not update.message.reply_to_message:
+        await update.message.reply_text("请先回复一条消息，再执行 /fwd")
+        return
+    try:
+        target_chat_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("chat_id 格式错误")
+        return
+
+    try:
+        await context.bot.forward_message(
+            chat_id=target_chat_id,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.reply_to_message.message_id,
+        )
+        await update.message.reply_text(f"✅ 已转发到 chat_id={target_chat_id}")
+    except Exception as e:
+        err = f"消息转发失败 target={target_chat_id}: {e.__class__.__name__}: {e}"
+        logger.exception(err)
+        await update.message.reply_text("❌ 转发失败，已触发告警")
+        await alert_admins(context.application, err)
+
+
+async def debugchat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    chat_type = chat.type if chat else None
+    lines = [
+        "调试信息：",
+        f"user_id={user_id}",
+        f"chat_id={chat_id}",
+        f"chat_type={chat_type}",
+        f"user_allowed={is_allowed(user_id)}",
+        f"chat_allowed={is_chat_allowed(chat_id)}",
+        f"authorized={is_authorized(update)}",
+        f"ALLOWED_CHAT_IDS={sorted(ALLOWED_CHAT_IDS) if ALLOWED_CHAT_IDS else '未配置(默认所有chat)'}",
+    ]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -464,7 +635,11 @@ def main():
     app.add_handler(CommandHandler("yesterday", yesterday))
     app.add_handler(CommandHandler("range", range_cmd))
     app.add_handler(CommandHandler("mchlist", mchlist))
+    app.add_handler(CommandHandler("find", find_cmd))
+    app.add_handler(CommandHandler("quick", quick_cmd))
     app.add_handler(CommandHandler("order", order_cmd))
+    app.add_handler(CommandHandler("fwd", fwd_cmd))
+    app.add_handler(CommandHandler("debugchat", debugchat_cmd))
     app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

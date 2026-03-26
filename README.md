@@ -18,7 +18,11 @@ Telegram bot for order summary queries.
   - `/yesterday [mch_id|mch_name]`
   - `/range YYYY-MM-DD YYYY-MM-DD [mch_id|mch_name]`
   - `/mchlist [keyword]`
+  - `/find <keyword>`
+  - `/quick [limit]`
   - `/order <order_no>`
+  - `/fwd <chat_id>` (reply message then forward)
+  - `/debugchat`
 
 ## Setup
 
